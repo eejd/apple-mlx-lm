@@ -128,7 +128,8 @@ class TestBareToolCallFilter(unittest.TestCase):
             t, c = f.feed(chunk)
             text += t
             calls += c
-        return text + f.flush(), calls
+        rest, rest_calls = f.flush()
+        return text + rest, calls + rest_calls
 
     def drive(self, chunks):
         """The server's generation loop in miniature: state machine, then the filter."""
@@ -140,6 +141,10 @@ class TestBareToolCallFilter(unittest.TestCase):
         text, tool_text, calls = "", "", []
         for chunk in chunks:
             state, clean, current = sm.step(state, chunk)
+            if prev == "normal" and current != "normal":
+                held, held_calls = f.flush()
+                text += held
+                calls += held_calls
             if current == "tool":
                 tool_text += clean
             elif current == "normal":
@@ -152,7 +157,8 @@ class TestBareToolCallFilter(unittest.TestCase):
             prev = current
         state, rest, _ = sm.flush(state)
         t, bare = f.feed(rest)
-        return text + t + f.flush(), calls + bare
+        held, held_calls = f.flush()
+        return text + t + held, calls + bare + held_calls
 
     def test_only_parsers_that_declare_markers_get_a_filter(self):
         self.assertIsNotNone(self.make())
@@ -251,7 +257,35 @@ class TestBareToolCallFilter(unittest.TestCase):
         f = self.make()
         out, _ = f.feed("see <fun")
         self.assertEqual(out, "see ")
-        self.assertEqual(f.flush(), "<fun")
+        self.assertEqual(f.flush(), ("<fun", []))
+
+    def test_state_change_in_the_loop_releases_the_held_marker_in_order(self):
+        text, calls = self.drive(["see <fun", "<tool_call>\n" + self.CALL + "\n</tool_call>"])
+        self.assertEqual(text.rstrip(), "see <fun")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_call_missing_a_parameter_closer_is_recovered_at_the_end(self):
+        sloppy = (
+            "<function=get_weather>\n<parameter=city>\nTokyo\n<parameter=days>\n3\n"
+            "</function>\n</tool_call>"
+        )
+        text, calls = self.run_chunks([sloppy])
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].count("<parameter="), calls[0].count("</parameter>"))
+        out = ToolCallFormatter(qwen3_coder.parse_tool_call, tools=None)(calls)
+        self.assertEqual(
+            json.loads(out[0]["function"]["arguments"]), {"city": "Tokyo", "days": "3"}
+        )
+
+    def test_a_cut_off_call_stays_text_even_with_a_name(self):
+        cut = "<function=get_weather>\n<parameter=city>\nTokyo\n<parameter=days>\n3"
+        text, calls = self.run_chunks([cut])
+        self.assertEqual((text, calls), (cut, []))
+
+    def test_no_declared_tools_means_nothing_is_recovered(self):
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>"], tools=[])
+        self.assertEqual(calls, [])
 
 
 class TestTextStateMachine(unittest.TestCase):
