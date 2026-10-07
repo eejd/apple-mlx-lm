@@ -16,13 +16,14 @@ from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
+    BareToolCallFilter,
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
 )
-from mlx_lm.tool_parsers import pythonic
+from mlx_lm.tool_parsers import pythonic, qwen3_coder
 from mlx_lm.utils import load
 
 
@@ -105,6 +106,87 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestBareToolCallFilter(unittest.TestCase):
+    """A model that skips the <tool_call> marker still gets its call parsed."""
+
+    CALL = "<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>"
+
+    def make(self):
+        return BareToolCallFilter.for_parser(qwen3_coder.parse_tool_call)
+
+    def run_chunks(self, chunks):
+        f = self.make()
+        text, calls = "", []
+        for chunk in chunks:
+            t, c = f.feed(chunk)
+            text += t
+            calls += c
+        return text + f.flush(), calls
+
+    def test_only_parsers_that_declare_markers_get_a_filter(self):
+        self.assertIsNotNone(self.make())
+        self.assertIsNone(BareToolCallFilter.for_parser(pythonic.parse_tool_call))
+
+    def test_bare_call_with_trailer(self):
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>"])
+        self.assertEqual(calls, [self.CALL])
+        self.assertEqual(text, "")
+
+    def test_bare_call_without_trailer(self):
+        text, calls = self.run_chunks([self.CALL])
+        self.assertEqual((text, calls), ("", [self.CALL]))
+
+    def test_every_chunking_gives_the_same_result(self):
+        full = "Sure.\n" + self.CALL + "\n</tool_call>"
+        for size in (1, 2, 3, 5, 7, len(full)):
+            chunks = [full[i : i + size] for i in range(0, len(full), size)]
+            text, calls = self.run_chunks(chunks)
+            self.assertEqual((text, calls), ("Sure.\n", [self.CALL]), size)
+
+    def test_parallel_bare_calls(self):
+        other = self.CALL.replace("get_weather", "read_file")
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>\n" + other + "\n</tool_call>"])
+        self.assertEqual((text, calls), ("", [self.CALL, other]))
+
+    def test_text_after_the_call_is_kept(self):
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>", " Done."])
+        self.assertEqual((text, calls), (" Done.", [self.CALL]))
+
+    def test_a_non_trailer_after_the_call_is_released(self):
+        text, calls = self.run_chunks([self.CALL + "\n</oops>"])
+        self.assertEqual((text, calls), ("\n</oops>", [self.CALL]))
+
+    def test_partial_marker_that_is_not_a_call_is_released(self):
+        text, calls = self.run_chunks(["a <func", "tion of x"])
+        self.assertEqual((text, calls), ("a <function of x", []))
+
+    def test_text_ending_in_a_partial_marker_is_released_on_flush(self):
+        text, calls = self.run_chunks(["call it <fun"])
+        self.assertEqual((text, calls), ("call it <fun", []))
+
+    def test_unfinished_call_is_released_as_text(self):
+        cut = "<function=get_weather>\n<parameter=city>\nTok"
+        text, calls = self.run_chunks([cut])
+        self.assertEqual((text, calls), (cut, []))
+
+    def test_recovered_call_parses_to_a_tool_call(self):
+        _, calls = self.run_chunks([self.CALL + "\n</tool_call>"])
+        out = ToolCallFormatter(qwen3_coder.parse_tool_call, tools=None)(calls)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(out[0]["function"]["arguments"]), {"city": "Tokyo"})
+
+    def test_wrapped_calls_never_reach_the_filter_path(self):
+        # The state machine strips <tool_call>...</tool_call>; what it emits is not a call.
+        sm = TextStateMachine(
+            {"normal": [("<tool_call>", "tool")], "tool": [("</tool_call>", "normal")]}
+        )
+        state = sm.make_state()
+        state, normal_text, current = sm.step(state, "hi")
+        text, calls = self.run_chunks([normal_text])
+        self.assertEqual((text, calls), ("hi", []))
 
 
 class TestTextStateMachine(unittest.TestCase):
