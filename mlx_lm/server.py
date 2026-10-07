@@ -223,13 +223,45 @@ class BareToolCallFilter:
         """
         rest, self._buf = self._buf, ""
         inside, after, self._inside, self._after = self._inside, self._after, False, 0
-        if inside and self._buf_has_call(rest):
-            j = rest.rfind(self._end) + len(self._end)
-            tail = rest[j:]
-            if self._trailer and tail.lstrip().startswith(self._trailer):
-                tail = tail.lstrip()[len(self._trailer) :]
-            return ("" if not tail.strip() else tail), [self._close_parameters(rest[:j])]
+        if inside:
+            calls, rest = self._recover_unbalanced(rest)
+            if calls:
+                return ("" if not rest.strip() else rest), calls
         return ("" if after and not rest.strip() else rest), []
+
+    def _recover_unbalanced(self, text):
+        """Split calls that never balanced their parameters off the front of ``text``.
+
+        Each call ends at the first end marker that is followed by the trailer, another call,
+        or the end of the text (so two calls are never merged and a value that contains the end
+        marker is not cut). Returns ``(calls, remaining_text)``.
+        """
+        calls = []
+        while self._buf_has_call(text):
+            cut, pos = -1, 0
+            while True:
+                j = text.find(self._end, pos)
+                if j < 0:
+                    break
+                pos = j + len(self._end)
+                after = text[pos:].lstrip()
+                starts = (self._trailer, self._start) if self._trailer else (self._start,)
+                if not after or after.startswith(starts):
+                    cut = pos
+                    break
+            if cut < 0:
+                break
+            calls.append(self._close_parameters(text[:cut]))
+            text = text[cut:]
+            lead = text.lstrip()
+            if self._trailer and lead.startswith(self._trailer):
+                text = lead[len(self._trailer) :]
+            lead = text.lstrip()
+            if lead.startswith(self._start):
+                text = lead
+            else:
+                break
+        return calls, text
 
     def _buf_has_call(self, text):
         """Whether ``text`` starts ``start NAME>`` for a declared tool and has an end marker."""
