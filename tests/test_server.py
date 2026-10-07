@@ -279,6 +279,24 @@ class TestBareToolCallFilter(unittest.TestCase):
             json.loads(out[0]["function"]["arguments"]), {"city": "Tokyo", "days": "3"}
         )
 
+    def test_parallel_calls_with_a_sloppy_first_are_not_merged(self):
+        sloppy = "<function=get_weather>\n<parameter=city>\nTokyo\n</function>"
+        good = "<function=read_file>\n<parameter=path>\n/a.py\n</parameter>\n</function>"
+        text, calls = self.run_chunks([sloppy + "\n</tool_call>\n" + good + "\n</tool_call>"])
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 2)
+        out = ToolCallFormatter(qwen3_coder.parse_tool_call, tools=None)(calls)
+        self.assertEqual(
+            [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in out],
+            [("get_weather", {"city": "Tokyo"}), ("read_file", {"path": "/a.py"})],
+        )
+
+    def test_two_sloppy_calls_and_trailing_text(self):
+        one = "<function=get_weather>\n<parameter=city>\nTokyo\n</function>"
+        two = "<function=read_file>\n<parameter=path>\n/a.py\n</function>"
+        text, calls = self.run_chunks([one + "\n</tool_call>\n" + two + "\n</tool_call>\nbye"])
+        self.assertEqual((len(calls), text), (2, "\nbye"))
+
     def test_a_cut_off_call_stays_text_even_with_a_name(self):
         cut = "<function=get_weather>\n<parameter=city>\nTokyo\n<parameter=days>\n3"
         text, calls = self.run_chunks([cut])
