@@ -120,6 +120,12 @@ tool_call_start = "<tool_call>"
 
 tool_call_end = "</tool_call>"
 
+# Smaller quantizations of this model sometimes skip the single <tool_call> token and write the
+# call as a bare <function=...>...</function> block. The server uses these to recover it.
+bare_tool_call_start = "<function="
+
+bare_tool_call_end = "</function>"
+
 
 def parse_tool_call(
     model_output: str,

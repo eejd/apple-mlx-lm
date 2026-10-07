@@ -10,6 +10,7 @@ import logging
 import pickle
 import platform
 import socket
+import sys
 import time
 import uuid
 import warnings
@@ -59,6 +60,99 @@ from .utils import (
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+class BareToolCallFilter:
+    """Recovers tool calls a model wrote without the opening tool-call marker.
+
+    The text state machine only enters tool mode on the tool-call start marker. A model that
+    skips it (as quantized Qwen3-Coder sometimes does, writing ``<function=...>...</function>``
+    followed by ``</tool_call>``) would otherwise get the call back as plain text. This filter sits
+    on the text the state machine emits in the normal state: it holds back anything that may be
+    the start of a bare call, returns each complete ``start ... end`` block as a tool call, and
+    drops a ``trailer`` that directly follows it. Text that turns out not to be a call is
+    released unchanged, and a block still open at the end of generation is released as text.
+    """
+
+    def __init__(self, start, end, trailer=None):
+        self._start = start
+        self._end = end
+        self._trailer = trailer
+        self._buf = ""
+        self._inside = False
+        # 1: a call just closed and a trailer may follow; 2: waiting to see if another call follows
+        self._after = 0
+
+    @classmethod
+    def for_parser(cls, tool_parser, trailer=None):
+        """A filter for ``tool_parser``'s module if it declares bare-call markers, else None."""
+        module = sys.modules.get(getattr(tool_parser, "__module__", ""))
+        start = getattr(module, "bare_tool_call_start", None)
+        end = getattr(module, "bare_tool_call_end", None)
+        if not start or not end:
+            return None
+        return cls(start, end, trailer or getattr(module, "tool_call_end", None))
+
+    def _partial_suffix(self, text, marker):
+        """Length of the longest proper prefix of ``marker`` that ``text`` ends with."""
+        for k in range(min(len(marker) - 1, len(text)), 0, -1):
+            if text.endswith(marker[:k]):
+                return k
+        return 0
+
+    def feed(self, text):
+        """Consume emitted text; returns ``(text_to_emit, completed_call_texts)``."""
+        self._buf += text
+        out = ""
+        calls = []
+        while True:
+            if self._inside:
+                j = self._buf.find(self._end)
+                if j < 0:
+                    break
+                j += len(self._end)
+                calls.append(self._buf[:j])
+                self._buf = self._buf[j:]
+                self._inside = False
+                self._after = 1
+                continue
+            if self._after == 1:
+                rest = self._buf.lstrip()
+                if self._trailer and rest.startswith(self._trailer):
+                    self._buf = rest[len(self._trailer) :]
+                    self._after = 2
+                    continue
+                if self._trailer and (not rest or self._trailer.startswith(rest)):
+                    break  # undecided: whitespace or part of the trailer so far
+                self._after = 2
+                continue
+            if self._after == 2:
+                # Whitespace between two bare calls is not content; anything else keeps it.
+                rest = self._buf.lstrip()
+                if not rest or self._start.startswith(rest):
+                    break
+                if rest.startswith(self._start):
+                    self._buf = rest
+                self._after = 0
+                continue
+            i = self._buf.find(self._start)
+            if i >= 0:
+                out += self._buf[:i]
+                self._buf = self._buf[i:]
+                self._inside = True
+                continue
+            keep = self._partial_suffix(self._buf, self._start)
+            out += self._buf[: len(self._buf) - keep]
+            self._buf = self._buf[len(self._buf) - keep :]
+            break
+        return out, calls
+
+    def flush(self):
+        """Release whatever is still held (an unfinished call, or undecided text) as text."""
+        rest, self._buf = self._buf, ""
+        self._inside = False
+        self._after = 0
+        return rest
 
 
 class ToolCallFormatter:
@@ -1591,6 +1685,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
+        bare_filter = (
+            BareToolCallFilter.for_parser(ctx.tool_parser) if ctx.has_tool_calling else None
+        )
 
         # Initialize the text state machine
         sm_state = ctx.text_sm.make_state(ctx.initial_state)
@@ -1633,6 +1730,11 @@ class APIHandler(BaseHTTPRequestHandler):
                             tool_calls.append(tool_text)
                             tool_text = ""
                             made_tool_call = True
+                        if bare_filter is not None:
+                            clean_text, bare_calls = bare_filter.feed(clean_text)
+                            if bare_calls:
+                                tool_calls.extend(bare_calls)
+                                made_tool_call = True
                         text += clean_text
                     prev_state = current_state
 
@@ -1666,6 +1768,9 @@ class APIHandler(BaseHTTPRequestHandler):
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
+
+            if bare_filter is not None:
+                text += bare_filter.flush()
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
