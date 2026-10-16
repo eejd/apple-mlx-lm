@@ -17,7 +17,9 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     BareToolCallFilter,
+    GenerationContext,
     LRUPromptCache,
+    Response,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
@@ -305,6 +307,145 @@ class TestBareToolCallFilter(unittest.TestCase):
     def test_no_declared_tools_means_nothing_is_recovered(self):
         text, calls = self.run_chunks([self.CALL + "\n</tool_call>"], tools=[])
         self.assertEqual(calls, [])
+
+
+class TestBareToolCallsThroughTheHandler(unittest.TestCase):
+    """Real HTTP requests through APIHandler.handle_completion with a scripted token stream.
+
+    Only the generation thread is replaced: ``ResponseGenerator.generate`` returns the
+    text chunks a model would produce, with the real qwen3_coder tool parser and the real
+    text state machine in the handler's loop.
+    """
+
+    CALL = "<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>"
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def scripted(self, chunks):
+        def generate(request, args, progress_callback=None):
+            ctx = GenerationContext(
+                has_tool_calling=True,
+                has_thinking=False,
+                tool_parser=qwen3_coder.parse_tool_call,
+                text_sm=TextStateMachine(
+                    {
+                        "normal": [("<tool_call>", "tool")],
+                        "tool": [("</tool_call>", "normal")],
+                    }
+                ),
+                initial_state="normal",
+                prompt=[1, 2, 3],
+            )
+
+            def responses():
+                for chunk in chunks:
+                    yield Response(chunk, 7, 0.0, None, ())
+                # the stop token carries no text; the handler discards the buffer on it
+                yield Response("", 2, 0.0, "stop", ())
+
+            return ctx, responses()
+
+        return mock.patch.object(self.response_generator, "generate", generate)
+
+    def post(self, chunks, tools=TOOLS, stream=False):
+        body = {
+            "model": "chat_model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+            "stream": stream,
+        }
+        if tools is not None:
+            body["tools"] = tools
+        with self.scripted(chunks):
+            r = requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                json=body,
+                stream=stream,
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            if not stream:
+                choice = r.json()["choices"][0]
+                return choice["message"], choice["finish_reason"]
+            content, calls, finish = "", [], None
+            for line in r.iter_lines():
+                if not line.startswith(b"data: ") or line.endswith(b"[DONE]"):
+                    continue
+                choice = json.loads(line[6:])["choices"][0]
+                delta = choice.get("delta", {})
+                content += delta.get("content") or ""
+                calls += delta.get("tool_calls") or []
+                finish = choice.get("finish_reason") or finish
+            return {"content": content, "tool_calls": calls}, finish
+
+    def check_call(self, message, finish):
+        self.assertEqual(finish, "tool_calls")
+        calls = message["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Tokyo"})
+
+    def test_bare_call_is_recovered(self):
+        message, finish = self.post(["<function=get_weather>\n", "<parameter=city>\nTokyo\n</parameter>\n</function>", "\n</tool_call>"])
+        self.check_call(message, finish)
+        self.assertFalse((message["content"] or "").strip())
+
+    def test_bare_call_is_recovered_when_streaming(self):
+        message, finish = self.post(
+            ["<function=get_weather>\n", "<parameter=city>\nTokyo\n</parameter>\n</function>", "\n</tool_call>"],
+            stream=True,
+        )
+        self.check_call(message, finish)
+
+    def test_plain_text_without_a_call_is_unchanged(self):
+        message, finish = self.post(["It is ", "sunny in ", "Tokyo."])
+        self.assertEqual(finish, "stop")
+        self.assertEqual(message["content"], "It is sunny in Tokyo.")
+        self.assertFalse(message.get("tool_calls"))
+
+    def test_held_marker_prefix_is_released_in_order_before_a_wrapped_call(self):
+        # "<fun" is held as a possible bare call; the wrapped call that follows must not
+        # swallow it or reorder it.
+        message, finish = self.post(
+            ["see <fun", "<tool_call>\n" + self.CALL + "\n</tool_call>"]
+        )
+        self.check_call(message, finish)
+        self.assertEqual(message["content"].strip(), "see <fun")
+
+    def test_without_tools_a_bare_block_stays_text(self):
+        message, finish = self.post(["<function=get_weather>\n</function>"], tools=None)
+        self.assertEqual(finish, "stop")
+        self.assertIn("<function=get_weather>", message["content"])
 
 
 class TestTextStateMachine(unittest.TestCase):
