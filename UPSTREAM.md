@@ -15,3 +15,6 @@ Not on `local` (not carried by any port): `fix/gpt-oss-harmony-channel-parsing`
 
 The `fix/*` branches are the heads of the upstream PRs above and are left untouched; the
 `topic/*` branches are their content rebased onto `main` (v0.32.2).
+
+Tags: `v0.32.2-local01` (superseded: its qwen3-coder port raised `UnboundLocalError` for any request with tools to a
+bare-call parser) and `v0.32.2-local02` (current; the flush now runs per segment, with handler-level tests).
