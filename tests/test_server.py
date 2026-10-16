@@ -442,6 +442,20 @@ class TestBareToolCallsThroughTheHandler(unittest.TestCase):
         self.check_call(message, finish)
         self.assertEqual(message["content"].strip(), "see <fun")
 
+    def test_held_text_is_released_at_a_state_change_inside_one_chunk(self):
+        # "<fun" is held as a possible bare call when the same chunk goes on into a wrapped
+        # call. If it is not released at that transition it stays in the filter's buffer
+        # and fuses with the text after the call ("<fun" + "ction=...>" would then be
+        # recovered as a second, bogus call).
+        after = (
+            "ction=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>"
+        )
+        message, finish = self.post(
+            ["see <fun<tool_call>\n" + self.CALL + "\n</tool_call>" + after]
+        )
+        self.check_call(message, finish)
+        self.assertEqual(message["content"].strip(), "see <fun" + after)
+
     def test_without_tools_a_bare_block_stays_text(self):
         message, finish = self.post(["<function=get_weather>\n</function>"], tools=None)
         self.assertEqual(finish, "stop")
