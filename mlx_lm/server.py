@@ -8,8 +8,10 @@ import io
 import json
 import logging
 import pickle
+import re
 import platform
 import socket
+import sys
 import time
 import uuid
 import warnings
@@ -59,6 +61,222 @@ from .utils import (
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+class BareToolCallFilter:
+    """Recovers tool calls a model wrote without the opening tool-call marker.
+
+    The text state machine only enters tool mode on the tool-call start marker. A model that
+    skips it (as quantized Qwen3-Coder sometimes does, writing ``<function=...>...</function>``
+    followed by ``</tool_call>``) would otherwise get the call back as plain text. This filter sits
+    on the text the state machine emits in the normal state: it holds back anything that may be
+    the start of a bare call, returns each complete block as a tool call, and drops a ``trailer``
+    that directly follows it. Text that is not a call is released unchanged.
+
+    A block counts as a call only if ``start`` is followed by ``NAME>`` where NAME is one of
+    ``tool_names`` (when given), and it ends at the first ``end`` after which every opened
+    ``<parameter=`` is closed, so prose that mentions the format, or a value that contains the
+    end marker, is not cut short. At the end of generation a block that never balanced its
+    parameters is still recovered (with the missing ``</parameter>`` added) if it has an end
+    marker; one cut off before that is released as text. Prose that names a declared tool and
+    contains a balanced block is indistinguishable from a call and is taken as one.
+    The filter is meant for requests that declare tools; without them there is nothing to call.
+    """
+
+    _MAX_NAME = 200
+
+    def __init__(self, start, end, trailer=None, tool_names=None):
+        self._start = start
+        self._end = end
+        self._trailer = trailer
+        self._names = None if tool_names is None else set(tool_names)
+        self._buf = ""
+        self._inside = False
+        # 1: a call just closed and a trailer may follow; 2: waiting to see if another call follows
+        self._after = 0
+
+    @staticmethod
+    def tool_names(tools):
+        names = set()
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function", tool)
+            name = function.get("name") if isinstance(function, dict) else None
+            if isinstance(name, str) and name:
+                names.add(name)
+        return names
+
+    @classmethod
+    def for_parser(cls, tool_parser, tools=None):
+        """A filter for ``tool_parser``'s module if it declares bare-call markers, else None."""
+        module = sys.modules.get(getattr(tool_parser, "__module__", ""))
+        start = getattr(module, "bare_tool_call_start", None)
+        end = getattr(module, "bare_tool_call_end", None)
+        if not start or not end:
+            return None
+        trailer = getattr(module, "tool_call_end", None)
+        return cls(start, end, trailer, cls.tool_names(tools))
+
+    @staticmethod
+    def _partial_suffix(text, marker):
+        """Length of the longest proper prefix of ``marker`` that ``text`` ends with."""
+        for k in range(min(len(marker) - 1, len(text)), 0, -1):
+            if text.endswith(marker[:k]):
+                return k
+        return 0
+
+    def _name_state(self):
+        """``"pending"``, ``"ok"`` or ``"bad"`` for the ``NAME>`` that follows ``start``."""
+        tail = self._buf[len(self._start) :]
+        m = re.match(r"([^\s<>]+)>", tail)
+        if m:
+            ok = self._names is None or m.group(1) in self._names
+            return "ok" if ok else "bad"
+        if re.fullmatch(r"[^\s<>]*", tail) and len(tail) <= self._MAX_NAME:
+            return "pending"
+        return "bad"
+
+    def _call_end(self):
+        """Index just past the end marker that closes the call, or -1."""
+        pos = 0
+        while True:
+            j = self._buf.find(self._end, pos)
+            if j < 0:
+                return -1
+            head = self._buf[:j]
+            if head.count("<parameter=") == head.count("</parameter>"):
+                return j + len(self._end)
+            pos = j + len(self._end)
+
+    def feed(self, text):
+        """Consume emitted text; returns ``(text_to_emit, completed_call_texts)``."""
+        self._buf += text
+        out = ""
+        calls = []
+        while True:
+            if self._inside:
+                state = self._name_state()
+                if state == "pending":
+                    break
+                if state == "bad":
+                    # Not a call: release the marker as text and look for the next one.
+                    out += self._buf[: len(self._start)]
+                    self._buf = self._buf[len(self._start) :]
+                    self._inside = False
+                    continue
+                j = self._call_end()
+                if j < 0:
+                    break
+                calls.append(self._buf[:j])
+                self._buf = self._buf[j:]
+                self._inside = False
+                self._after = 1
+                continue
+            if self._after == 1:
+                rest = self._buf.lstrip()
+                if self._trailer and rest.startswith(self._trailer):
+                    self._buf = rest[len(self._trailer) :]
+                    self._after = 2
+                    continue
+                if self._trailer and (not rest or self._trailer.startswith(rest)):
+                    break  # undecided: whitespace or part of the trailer so far
+                self._after = 2
+                continue
+            if self._after == 2:
+                # Whitespace between two bare calls is not content; anything else keeps it.
+                rest = self._buf.lstrip()
+                if not rest or self._start.startswith(rest):
+                    break
+                if rest.startswith(self._start):
+                    self._buf = rest
+                self._after = 0
+                continue
+            i = self._buf.find(self._start)
+            if i >= 0:
+                out += self._buf[:i]
+                self._buf = self._buf[i:]
+                self._inside = True
+                continue
+            keep = self._partial_suffix(self._buf, self._start)
+            out += self._buf[: len(self._buf) - keep]
+            self._buf = self._buf[len(self._buf) - keep :]
+            break
+        return out, calls
+
+    def _close_parameters(self, call):
+        """Insert the ``</parameter>`` a model left out before the next parameter or the end."""
+        out, depth_open = [], False
+        for piece in re.split(r"(<parameter=|</parameter>|" + re.escape(self._end) + ")", call):
+            if piece == "<parameter=":
+                if depth_open:
+                    out.append("</parameter>\n")
+                depth_open = True
+            elif piece == "</parameter>":
+                depth_open = False
+            elif piece == self._end and depth_open:
+                out.append("</parameter>\n")
+                depth_open = False
+            out.append(piece)
+        return "".join(out)
+
+    def flush(self):
+        """Release what is still held; returns ``(text, calls)``.
+
+        A block that names a declared tool and holds an end marker but never balanced its
+        parameters (the model left out a ``</parameter>``) is recovered as a call, with the
+        missing closers added. Anything else still held, such as a call cut off before its end
+        marker, is returned as text. Whitespace that only trailed a recovered call is dropped.
+        """
+        rest, self._buf = self._buf, ""
+        inside, after, self._inside, self._after = self._inside, self._after, False, 0
+        if inside:
+            calls, rest = self._recover_unbalanced(rest)
+            if calls:
+                return ("" if not rest.strip() else rest), calls
+        return ("" if after and not rest.strip() else rest), []
+
+    def _recover_unbalanced(self, text):
+        """Split calls that never balanced their parameters off the front of ``text``.
+
+        Each call ends at the first end marker that is followed by the trailer, another call,
+        or the end of the text (so two calls are never merged and a value that contains the end
+        marker is not cut). Returns ``(calls, remaining_text)``.
+        """
+        calls = []
+        while self._buf_has_call(text):
+            cut, pos = -1, 0
+            while True:
+                j = text.find(self._end, pos)
+                if j < 0:
+                    break
+                pos = j + len(self._end)
+                after = text[pos:].lstrip()
+                starts = (self._trailer, self._start) if self._trailer else (self._start,)
+                if not after or after.startswith(starts):
+                    cut = pos
+                    break
+            if cut < 0:
+                break
+            calls.append(self._close_parameters(text[:cut]))
+            text = text[cut:]
+            lead = text.lstrip()
+            if self._trailer and lead.startswith(self._trailer):
+                text = lead[len(self._trailer) :]
+            lead = text.lstrip()
+            if lead.startswith(self._start):
+                text = lead
+            else:
+                break
+        return calls, text
+
+    def _buf_has_call(self, text):
+        """Whether ``text`` starts ``start NAME>`` for a declared tool and has an end marker."""
+        tail = text[len(self._start) :]
+        m = re.match(r"([^\s<>]+)>", tail)
+        if not m or (self._names is not None and m.group(1) not in self._names):
+            return False
+        return self._end in text
 
 
 class ToolCallFormatter:
@@ -1591,6 +1809,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
+        bare_filter = (
+            BareToolCallFilter.for_parser(ctx.tool_parser, request.tools)
+            if ctx.has_tool_calling and request.tools
+            else None
+        )
 
         # Initialize the text state machine
         sm_state = ctx.text_sm.make_state(ctx.initial_state)
@@ -1622,6 +1845,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     sm_state, segments = TextStateMachine.split(sm_state, gen.text)
 
+                # Text held back as a possible bare call is released before another state starts
+                if (
+                    bare_filter is not None
+                    and prev_state == "normal"
+                    and current_state != "normal"
+                ):
+                    rest_text, rest_calls = bare_filter.flush()
+                    text += rest_text
+                    if rest_calls:
+                        tool_calls.extend(rest_calls)
+                        made_tool_call = True
+
                 # Collect the clean text by state: reasoning, tool, or normal
                 for current_state, clean_text in segments:
                     if current_state == "reasoning":
@@ -1633,6 +1868,11 @@ class APIHandler(BaseHTTPRequestHandler):
                             tool_calls.append(tool_text)
                             tool_text = ""
                             made_tool_call = True
+                        if bare_filter is not None:
+                            clean_text, bare_calls = bare_filter.feed(clean_text)
+                            if bare_calls:
+                                tool_calls.extend(bare_calls)
+                                made_tool_call = True
                         text += clean_text
                     prev_state = current_state
 
@@ -1666,6 +1906,13 @@ class APIHandler(BaseHTTPRequestHandler):
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
+
+            if bare_filter is not None:
+                rest_text, rest_calls = bare_filter.flush()
+                text += rest_text
+                if rest_calls:
+                    tool_calls.extend(rest_calls)
+                    made_tool_call = True
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"

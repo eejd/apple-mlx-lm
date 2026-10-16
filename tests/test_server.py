@@ -16,13 +16,14 @@ from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
+    BareToolCallFilter,
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
 )
-from mlx_lm.tool_parsers import pythonic
+from mlx_lm.tool_parsers import pythonic, qwen3_coder
 from mlx_lm.utils import load
 
 
@@ -106,6 +107,204 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestBareToolCallFilter(unittest.TestCase):
+    """A model that skips the <tool_call> marker still gets its call parsed."""
+
+    CALL = "<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>"
+    TOOLS = [
+        {"type": "function", "function": {"name": "get_weather"}},
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "write_file"}},
+    ]
+
+    def make(self, tools=TOOLS):
+        return BareToolCallFilter.for_parser(qwen3_coder.parse_tool_call, tools)
+
+    def run_chunks(self, chunks, tools=TOOLS):
+        f = self.make(tools)
+        text, calls = "", []
+        for chunk in chunks:
+            t, c = f.feed(chunk)
+            text += t
+            calls += c
+        rest, rest_calls = f.flush()
+        return text + rest, calls + rest_calls
+
+    def drive(self, chunks):
+        """The server's generation loop in miniature: state machine, then the filter."""
+        sm = TextStateMachine(
+            {"normal": [("<tool_call>", "tool")], "tool": [("</tool_call>", "normal")]}
+        )
+        state, prev = sm.make_state(), "normal"
+        f = self.make()
+        text, tool_text, calls = "", "", []
+        for chunk in chunks:
+            state, clean, current = sm.step(state, chunk)
+            if prev == "normal" and current != "normal":
+                held, held_calls = f.flush()
+                text += held
+                calls += held_calls
+            if current == "tool":
+                tool_text += clean
+            elif current == "normal":
+                if prev == "tool":
+                    calls.append(tool_text)
+                    tool_text = ""
+                clean, bare = f.feed(clean)
+                calls += bare
+                text += clean
+            prev = current
+        state, rest, _ = sm.flush(state)
+        t, bare = f.feed(rest)
+        held, held_calls = f.flush()
+        return text + t + held, calls + bare + held_calls
+
+    def test_only_parsers_that_declare_markers_get_a_filter(self):
+        self.assertIsNotNone(self.make())
+        self.assertIsNone(BareToolCallFilter.for_parser(pythonic.parse_tool_call, self.TOOLS))
+        self.assertIsNone(BareToolCallFilter.for_parser(None, self.TOOLS))
+
+    def test_tool_names(self):
+        names = BareToolCallFilter.tool_names(self.TOOLS + [{"name": "plain"}, None, "x", {}])
+        self.assertEqual(names, {"get_weather", "read_file", "write_file", "plain"})
+
+    def test_bare_call_with_trailer(self):
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>"])
+        self.assertEqual((text, calls), ("", [self.CALL]))
+
+    def test_bare_call_without_trailer(self):
+        text, calls = self.run_chunks([self.CALL])
+        self.assertEqual((text, calls), ("", [self.CALL]))
+
+    def test_trailing_whitespace_after_a_call_is_not_content(self):
+        for tail in ("\n", "\n</tool_call>\n", "  \n</tool_call>"):
+            text, calls = self.run_chunks([self.CALL + tail])
+            self.assertEqual((text, calls), ("", [self.CALL]), repr(tail))
+
+    def test_every_chunking_gives_the_same_result(self):
+        full = "Sure.\n" + self.CALL + "\n</tool_call>"
+        for size in (1, 2, 3, 5, 7, len(full)):
+            chunks = [full[i : i + size] for i in range(0, len(full), size)]
+            text, calls = self.run_chunks(chunks)
+            self.assertEqual((text, calls), ("Sure.\n", [self.CALL]), size)
+
+    def test_parallel_bare_calls(self):
+        other = self.CALL.replace("get_weather", "read_file")
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>\n" + other + "\n</tool_call>"])
+        self.assertEqual((text, calls), ("", [self.CALL, other]))
+
+    def test_text_after_the_call_is_kept(self):
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>", " Done."])
+        self.assertEqual((text, calls), (" Done.", [self.CALL]))
+
+    def test_a_non_trailer_after_the_call_is_released(self):
+        text, calls = self.run_chunks([self.CALL + "\n</oops>"])
+        self.assertEqual((text, calls), ("\n</oops>", [self.CALL]))
+
+    def test_partial_marker_that_is_not_a_call_is_released(self):
+        text, calls = self.run_chunks(["a <func", "tion of x"])
+        self.assertEqual((text, calls), ("a <function of x", []))
+
+    def test_text_ending_in_a_partial_marker_is_released_on_flush(self):
+        text, calls = self.run_chunks(["call it <fun"])
+        self.assertEqual((text, calls), ("call it <fun", []))
+
+    def test_unfinished_call_is_released_as_text(self):
+        cut = "<function=get_weather>\n<parameter=city>\nTok"
+        text, calls = self.run_chunks([cut])
+        self.assertEqual((text, calls), (cut, []))
+
+    def test_undeclared_name_is_prose_and_does_not_stall(self):
+        f = self.make()
+        out, calls = f.feed("Qwen uses <function=name> format. ")
+        self.assertEqual((out, calls), ("Qwen uses <function=name> format. ", []))
+        out, _ = f.feed("More text")
+        self.assertEqual(out, "More text")
+
+    def test_marker_not_followed_by_a_name_is_prose(self):
+        text, calls = self.run_chunks(["see <function= here and <function=a b> too"])
+        self.assertEqual((text, calls), ("see <function= here and <function=a b> too", []))
+
+    def test_end_marker_inside_a_value_does_not_cut_the_call(self):
+        call = (
+            "<function=write_file>\n<parameter=content>\nx = '</function>'\n</parameter>\n"
+            "<parameter=path>\n/a.py\n</parameter>\n</function>"
+        )
+        text, calls = self.run_chunks([call + "\n</tool_call>"])
+        self.assertEqual((text, calls), ("", [call]))
+
+    def test_recovered_call_parses_to_a_tool_call(self):
+        _, calls = self.run_chunks([self.CALL + "\n</tool_call>"])
+        out = ToolCallFormatter(qwen3_coder.parse_tool_call, tools=None)(calls)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(out[0]["function"]["arguments"]), {"city": "Tokyo"})
+
+    def test_wrapped_and_bare_calls_mix_in_order(self):
+        wrapped = self.CALL.replace("get_weather", "read_file")
+        full = "Hi. <tool_call>\n" + wrapped + "\n</tool_call>\n" + self.CALL + "\n</tool_call>"
+        for size in (1, 4, len(full)):
+            chunks = [full[i : i + size] for i in range(0, len(full), size)]
+            text, calls = self.drive(chunks)
+            # Whitespace between a wrapped call and what follows is existing behaviour.
+            self.assertEqual(text.strip(), "Hi.", size)
+            self.assertEqual(len(calls), 2, size)
+            self.assertIn("read_file", calls[0])
+            self.assertIn("get_weather", calls[1])
+
+    def test_flush_releases_a_held_marker_before_another_state(self):
+        f = self.make()
+        out, _ = f.feed("see <fun")
+        self.assertEqual(out, "see ")
+        self.assertEqual(f.flush(), ("<fun", []))
+
+    def test_state_change_in_the_loop_releases_the_held_marker_in_order(self):
+        text, calls = self.drive(["see <fun", "<tool_call>\n" + self.CALL + "\n</tool_call>"])
+        self.assertEqual(text.rstrip(), "see <fun")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_call_missing_a_parameter_closer_is_recovered_at_the_end(self):
+        sloppy = (
+            "<function=get_weather>\n<parameter=city>\nTokyo\n<parameter=days>\n3\n"
+            "</function>\n</tool_call>"
+        )
+        text, calls = self.run_chunks([sloppy])
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].count("<parameter="), calls[0].count("</parameter>"))
+        out = ToolCallFormatter(qwen3_coder.parse_tool_call, tools=None)(calls)
+        self.assertEqual(
+            json.loads(out[0]["function"]["arguments"]), {"city": "Tokyo", "days": "3"}
+        )
+
+    def test_parallel_calls_with_a_sloppy_first_are_not_merged(self):
+        sloppy = "<function=get_weather>\n<parameter=city>\nTokyo\n</function>"
+        good = "<function=read_file>\n<parameter=path>\n/a.py\n</parameter>\n</function>"
+        text, calls = self.run_chunks([sloppy + "\n</tool_call>\n" + good + "\n</tool_call>"])
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 2)
+        out = ToolCallFormatter(qwen3_coder.parse_tool_call, tools=None)(calls)
+        self.assertEqual(
+            [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in out],
+            [("get_weather", {"city": "Tokyo"}), ("read_file", {"path": "/a.py"})],
+        )
+
+    def test_two_sloppy_calls_and_trailing_text(self):
+        one = "<function=get_weather>\n<parameter=city>\nTokyo\n</function>"
+        two = "<function=read_file>\n<parameter=path>\n/a.py\n</function>"
+        text, calls = self.run_chunks([one + "\n</tool_call>\n" + two + "\n</tool_call>\nbye"])
+        self.assertEqual((len(calls), text), (2, "\nbye"))
+
+    def test_a_cut_off_call_stays_text_even_with_a_name(self):
+        cut = "<function=get_weather>\n<parameter=city>\nTokyo\n<parameter=days>\n3"
+        text, calls = self.run_chunks([cut])
+        self.assertEqual((text, calls), (cut, []))
+
+    def test_no_declared_tools_means_nothing_is_recovered(self):
+        text, calls = self.run_chunks([self.CALL + "\n</tool_call>"], tools=[])
+        self.assertEqual(calls, [])
 
 
 class TestTextStateMachine(unittest.TestCase):
