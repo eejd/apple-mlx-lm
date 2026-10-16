@@ -1845,20 +1845,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     sm_state, segments = TextStateMachine.split(sm_state, gen.text)
 
-                # Text held back as a possible bare call is released before another state starts
-                if (
-                    bare_filter is not None
-                    and prev_state == "normal"
-                    and current_state != "normal"
-                ):
-                    rest_text, rest_calls = bare_filter.flush()
-                    text += rest_text
-                    if rest_calls:
-                        tool_calls.extend(rest_calls)
-                        made_tool_call = True
-
                 # Collect the clean text by state: reasoning, tool, or normal
                 for current_state, clean_text in segments:
+                    # Text held back as a possible bare call is released before
+                    # another state starts
+                    if (
+                        bare_filter is not None
+                        and prev_state == "normal"
+                        and current_state != "normal"
+                    ):
+                        rest_text, rest_calls = bare_filter.flush()
+                        text += rest_text
+                        if rest_calls:
+                            tool_calls.extend(rest_calls)
+                            made_tool_call = True
+
                     if current_state == "reasoning":
                         reasoning_text += clean_text
                     elif current_state == "tool":
